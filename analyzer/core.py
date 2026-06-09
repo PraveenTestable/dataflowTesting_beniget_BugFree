@@ -1,37 +1,67 @@
 """
-core.py - Dead code and unused-variable analyzer built on beniget def-use chains.
+core.py - Static analyzer built on beniget def-use chains.
 
-Supports Python 3.6+.
+Compatible with beniget 0.4.x and 0.5.x, Python 3.6+.
 
-Key features
-------------
-- Variable Definition Detection  : finds every name defined in a module/function/class
-- Definition-Use Mapping         : maps each definition to the list of nodes that use it
-- Coverage Measurement           : reports what percentage of definitions are actually used
-- Uncovered Definition Detection : surfaces unused definitions as Issues
-- Edge Case Handling             : lambdas, comprehensions, classes, try/except, with, augassign
+beniget 0.5.x API (used throughout):
+  duc.locals[scope]   -> ordered_set of Def objects  (NOT a {name:[Def]} dict)
+  defn.name()         -> str identifier (callable method)
+  defn.users()        -> list[Def] – every node that uses this definition
+  defn.node           -> underlying gast AST node
+
+beniget 0.4.x fallback:
+  duc.locals[scope]   -> dict {name: [Def]}
 """
 import gast
 from beniget import DefUseChains
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Def-use map data structures
+# Compatibility helper
+# ---------------------------------------------------------------------------
+
+def _iter_scope_defs(duc, scope):
+    # type: (DefUseChains, object) -> Iterator[Tuple[str, object]]
+    """
+    Yield (name, Def) for every definition in *scope*.
+
+    Handles both beniget 0.4.x (dict) and 0.5.x (ordered_set).
+    """
+    scope_data = duc.locals.get(scope)
+    if scope_data is None:
+        return
+
+    if hasattr(scope_data, "items"):
+        # beniget 0.4.x: {name: [Def, ...]}
+        for name, defs in scope_data.items():
+            for defn in defs:
+                yield name, defn
+    else:
+        # beniget 0.5.x: ordered_set of Def objects
+        for defn in scope_data:
+            raw = defn.name
+            name = raw() if callable(raw) else str(raw)
+            yield name, defn
+
+
+# ---------------------------------------------------------------------------
+# Data containers
 # ---------------------------------------------------------------------------
 
 class DefUseEntry:
-    """One definition and every location that uses it."""
+    """One definition and every location that references it."""
 
-    KINDS = ("variable", "parameter", "function", "class", "import", "lambda", "comprehension")
+    KINDS = ("variable", "parameter", "function", "class",
+             "import", "lambda", "comprehension", "other")
 
     def __init__(self, name, kind, lineno, col_offset=0):
         self.name = name
-        self.kind = kind                  # one of KINDS
+        self.kind = kind
         self.lineno = lineno
         self.col_offset = col_offset
-        self.uses = []                    # list of (lineno, col_offset)
+        self.uses = []   # type: List[Tuple[int, int]]
 
     def add_use(self, lineno, col_offset=0):
         self.uses.append((lineno, col_offset))
@@ -42,7 +72,7 @@ class DefUseEntry:
 
     @property
     def is_covered(self):
-        return len(self.uses) > 0
+        return bool(self.uses)
 
     def __repr__(self):
         return "DefUseEntry(name={!r}, kind={!r}, lineno={}, uses={})".format(
@@ -51,12 +81,12 @@ class DefUseEntry:
 
 
 class CoverageMetrics:
-    """Coverage summary for one analysed file."""
+    """Coverage summary: how many definitions are actually used."""
 
     def __init__(self):
         self.total_defs = 0
         self.covered_defs = 0
-        self.entries = []          # type: List[DefUseEntry]
+        self.entries = []   # type: List[DefUseEntry]
 
     def add_entry(self, entry):
         # type: (DefUseEntry) -> None
@@ -77,17 +107,13 @@ class CoverageMetrics:
         return [e for e in self.entries if not e.is_covered]
 
     def __repr__(self):
-        return "CoverageMetrics(total={}, covered={}, pct={})".format(
+        return "CoverageMetrics(total={}, covered={}, pct={:.1f}%)".format(
             self.total_defs, self.covered_defs, self.coverage_pct
         )
 
 
-# ---------------------------------------------------------------------------
-# Issue
-# ---------------------------------------------------------------------------
-
 class Issue:
-    """Represents a single analysis finding."""
+    """A single analysis finding."""
 
     SEVERITY_LOW = 1
     SEVERITY_MEDIUM = 2
@@ -106,20 +132,21 @@ class Issue:
         )
 
 
-# ---------------------------------------------------------------------------
-# AnalysisResult
-# ---------------------------------------------------------------------------
-
 class AnalysisResult:
-    """Aggregated result for a single source file."""
+    """All findings for a single source file."""
 
     def __init__(self, filepath):
         self.filepath = filepath
-        self.issues = []                   # type: List[Issue]
-        self.errors = []                   # type: List[str]
+        self.issues = []                    # type: List[Issue]
+        self.errors = []                    # type: List[str]
         self.loc = 0
-        self.def_use_map = {}              # (lineno, col) -> DefUseEntry
-        self.coverage = CoverageMetrics()  # coverage measurement
+        self.def_use_map = {}               # type: Dict[Tuple, DefUseEntry]
+        self.coverage = CoverageMetrics()
+
+    # convenience alias so callers can use result.coverage_pct directly
+    @property
+    def coverage_pct(self):
+        return self.coverage.coverage_pct
 
     def add_issue(self, issue):
         self.issues.append(issue)
@@ -138,6 +165,21 @@ class AnalysisResult:
         """Return issues at or above *min_severity*."""
         return [i for i in self.issues if i.severity >= min_severity]
 
+    def get_def_at(self, lineno, name=None):
+        # type: (int, Optional[str]) -> Optional[DefUseEntry]
+        """Return the DefUseEntry defined on *lineno* (optionally matching *name*)."""
+        for key, entry in self.def_use_map.items():
+            if entry.lineno == lineno:
+                if name is None or entry.name == name:
+                    return entry
+        return None
+
+    def get_uses_for(self, lineno, name=None):
+        # type: (int, Optional[str]) -> List[Tuple[int, int]]
+        """Return all use-sites for the definition on *lineno*."""
+        entry = self.get_def_at(lineno, name)
+        return entry.uses if entry else []
+
     def summary(self):
         kinds = defaultdict(int)
         for issue in self.issues:
@@ -148,13 +190,13 @@ class AnalysisResult:
     def __repr__(self):
         return (
             "AnalysisResult(filepath={!r}, issues={}, coverage={:.1f}%)".format(
-                self.filepath, self.total_issues, self.coverage.coverage_pct
+                self.filepath, self.total_issues, self.coverage_pct
             )
         )
 
 
 # ---------------------------------------------------------------------------
-# Built-in name set
+# Built-in names (never flagged as undefined / unused)
 # ---------------------------------------------------------------------------
 
 BUILTIN_NAMES = {
@@ -165,52 +207,58 @@ BUILTIN_NAMES = {
     "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
     "AttributeError", "RuntimeError", "StopIteration", "NotImplementedError",
     "OSError", "IOError", "True", "False", "None", "__name__", "__file__",
-    "__doc__", "abs", "all", "any", "bin", "chr", "dir", "divmod", "format",
-    "hash", "hex", "id", "input", "max", "min", "oct", "ord", "pow",
-    "repr", "reversed", "round", "sorted", "sum", "vars",
-    "staticmethod", "classmethod", "property", "NotImplemented",
+    "__doc__", "__all__", "__slots__", "abs", "all", "any", "bin", "chr",
+    "dir", "divmod", "format", "hash", "hex", "id", "input", "max", "min",
+    "oct", "ord", "pow", "repr", "reversed", "round", "sorted", "sum",
+    "vars", "staticmethod", "classmethod", "property", "NotImplemented",
+    "bytearray", "bytes", "complex", "frozenset", "memoryview", "slice",
+    "ArithmeticError", "AssertionError", "BlockingIOError", "BrokenPipeError",
+    "BufferError", "ChildProcessError", "ConnectionError", "EOFError",
+    "EnvironmentError", "FileExistsError", "FileNotFoundError",
+    "FloatingPointError", "GeneratorExit", "ImportError", "InterruptedError",
+    "IsADirectoryError", "LookupError", "MemoryError", "ModuleNotFoundError",
+    "NameError", "NotADirectoryError", "OverflowError", "PermissionError",
+    "ProcessLookupError", "RecursionError", "ReferenceError", "SyntaxError",
+    "SystemError", "SystemExit", "TimeoutError", "UnicodeDecodeError",
+    "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError",
+    "UserWarning", "Warning", "ZeroDivisionError",
+    "BaseException", "BaseExceptionGroup", "ExceptionGroup",
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _node_kind(node):
-    # type: (object) -> str
+def _node_kind(node, scope=None):
+    # type: (object, object) -> str
     if isinstance(node, (gast.FunctionDef, gast.AsyncFunctionDef)):
         return "function"
     if isinstance(node, gast.ClassDef):
         return "class"
     if isinstance(node, (gast.Import, gast.ImportFrom)):
         return "import"
-    if isinstance(node, gast.arg):
-        return "parameter"
     if isinstance(node, gast.Lambda):
         return "lambda"
     if isinstance(node, (gast.ListComp, gast.SetComp, gast.DictComp, gast.GeneratorExp)):
         return "comprehension"
+    # Detect function parameters: Name nodes inside function arg lists
+    if isinstance(node, gast.Name) and scope is not None:
+        if isinstance(scope, (gast.FunctionDef, gast.AsyncFunctionDef, gast.Lambda)):
+            args = scope.args
+            param_nodes = list(args.args)
+            if hasattr(args, "posonlyargs"):
+                param_nodes += list(args.posonlyargs)
+            if args.vararg:
+                param_nodes.append(args.vararg)
+            if args.kwarg:
+                param_nodes.append(args.kwarg)
+            param_nodes += list(args.kwonlyargs)
+            if node in param_nodes:
+                return "parameter"
     return "variable"
 
 
-def _scope_nodes(module):
-    # type: (gast.Module) -> list
-    """Return all nodes that introduce a new scope (including edge cases)."""
-    scopes = []
-    for node in gast.walk(module):
-        if isinstance(node, (
-            gast.Module,
-            gast.FunctionDef,
-            gast.AsyncFunctionDef,
-            gast.ClassDef,
-            gast.Lambda,
-            gast.ListComp,
-            gast.SetComp,
-            gast.DictComp,
-            gast.GeneratorExp,
-        )):
-            scopes.append(node)
-    return scopes
+def _is_synthetic(name):
+    # type: (str) -> bool
+    """Return True for beniget-internal synthetic names like '<ListComp>'."""
+    return name.startswith("<") and name.endswith(">")
 
 
 # ---------------------------------------------------------------------------
@@ -219,29 +267,30 @@ def _scope_nodes(module):
 
 class CodeAnalyzer:
     """
-    Builds def-use maps, measures coverage, and detects issues using beniget.
+    Analyses Python source using beniget def-use chains.
 
-    Handles:
-    - Regular functions and async functions
-    - Lambda expressions
-    - List / set / dict comprehensions and generator expressions
-    - Class definitions and methods
-    - Try / except / finally (ExceptHandler bindings)
-    - With-statement target bindings
-    - Augmented assignments
-    - Global / nonlocal declarations
+    Covers:
+      Variable Definition Detection  – every name defined anywhere in the file
+      Definition-Use Mapping         – each definition -> list of use sites
+      Coverage Measurement           – % of definitions with ≥1 use
+      Uncovered Definition Detection – definitions with zero uses
+      Edge Case Handling             – lambdas, comprehensions, classes,
+                                       try/except bindings, with-targets,
+                                       augmented assignments, nested scopes,
+                                       imports, *args/**kwargs, decorators
     """
 
     def __init__(self, ignore_private=False, ignore_underscore=True):
         self.ignore_private = ignore_private
         self.ignore_underscore = ignore_underscore
-        self._results = {}
+        self._results = {}   # type: Dict[str, AnalysisResult]
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def analyze_source(self, source, filepath="<string>"):
+        # type: (str, str) -> AnalysisResult
         """Parse *source* and return a fully populated :class:`AnalysisResult`."""
         result = AnalysisResult(filepath)
         result.loc = source.count("\n") + 1
@@ -249,29 +298,30 @@ class CodeAnalyzer:
         try:
             module = gast.parse(source)
         except SyntaxError as exc:
-            result.add_error("SyntaxError at line {}: {}".format(exc.lineno, exc.msg))
+            result.add_error("SyntaxError at line {}: {}".format(
+                exc.lineno, exc.msg))
             return result
 
         try:
             duc = DefUseChains()
             duc.visit(module)
         except Exception as exc:
-            result.add_error("beniget internal error: {}".format(exc))
+            result.add_error("beniget error: {}".format(exc))
             return result
 
+        # Core passes ─ order matters
         self._build_def_use_map(module, duc, result)
         self._compute_coverage(result)
         self._check_unused_vars(module, duc, result)
         self._check_undefined_names(module, duc, result)
         self._check_dead_code(module, result)
-        self._check_edge_cases(module, duc, result)
         self._check_shadowed_names(module, duc, result)
 
         self._results[filepath] = result
         return result
 
     def analyze_file(self, filepath):
-        """Read *filepath* and delegate to :meth:`analyze_source`."""
+        # type: (str) -> AnalysisResult
         try:
             with open(filepath, "r", encoding="utf-8") as fh:
                 source = fh.read()
@@ -290,37 +340,51 @@ class CodeAnalyzer:
 
     def _build_def_use_map(self, module, duc, result):
         """
-        Build result.def_use_map: maps (lineno, col_offset) -> DefUseEntry
-        for every definition reachable via beniget chains.
-        Covers all scope types including lambdas and comprehensions.
+        Populate result.def_use_map: (lineno, col, name) -> DefUseEntry.
+
+        Iterates EVERY scope beniget knows about, which automatically covers:
+        - Module level
+        - Functions and async functions
+        - Classes and their methods
+        - Lambda expressions
+        - List / set / dict comprehensions and generator expressions
+        - Nested / inner functions
+        - Exception-handler bindings  (appear in enclosing scope)
+        - with-statement targets       (appear in enclosing scope)
         """
-        for scope in _scope_nodes(module):
-            scope_locals = duc.locals.get(scope, {})
-            for name, defs in scope_locals.items():
-                for defn in defs:
-                    node = defn.node
-                    if not hasattr(node, "lineno"):
-                        continue
-                    lineno = node.lineno
-                    col = getattr(node, "col_offset", 0)
-                    key = (lineno, col, name)
+        seen = set()
 
-                    entry = DefUseEntry(
-                        name=name,
-                        kind=_node_kind(node),
-                        lineno=lineno,
-                        col_offset=col,
-                    )
+        for scope in duc.locals:
+            for name, defn in _iter_scope_defs(duc, scope):
+                if _is_synthetic(name):
+                    continue
 
-                    chain = duc.chains.get(defn)
-                    if chain is not None:
-                        for user in chain.users():
-                            u_node = user.node
-                            if hasattr(u_node, "lineno"):
-                                entry.add_use(u_node.lineno,
-                                              getattr(u_node, "col_offset", 0))
+                node = defn.node
+                if not hasattr(node, "lineno"):
+                    continue
 
-                    result.def_use_map[key] = entry
+                lineno = node.lineno
+                col = getattr(node, "col_offset", 0)
+                key = (lineno, col, name)
+
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                entry = DefUseEntry(
+                    name=name,
+                    kind=_node_kind(node, scope),
+                    lineno=lineno,
+                    col_offset=col,
+                )
+
+                # defn.users() is beniget's direct API – works in both 0.4.x and 0.5.x
+                for user in defn.users():
+                    u = user.node
+                    if hasattr(u, "lineno"):
+                        entry.add_use(u.lineno, getattr(u, "col_offset", 0))
+
+                result.def_use_map[key] = entry
 
     # ------------------------------------------------------------------
     # Coverage Measurement
@@ -329,52 +393,72 @@ class CodeAnalyzer:
     def _compute_coverage(self, result):
         """
         Populate result.coverage from result.def_use_map.
-        Skips builtins and private names if configured.
+
+        Every non-synthetic, non-builtin definition counts toward
+        total_defs; those with ≥1 use count toward covered_defs.
         """
         for entry in result.def_use_map.values():
             if entry.name in BUILTIN_NAMES:
+                continue
+            if _is_synthetic(entry.name):
                 continue
             if self.ignore_underscore and entry.name.startswith("_"):
                 continue
             result.coverage.add_entry(entry)
 
     # ------------------------------------------------------------------
-    # Issue detection passes
+    # Issue detection
     # ------------------------------------------------------------------
 
+    def _should_skip(self, name):
+        # type: (str) -> bool
+        if _is_synthetic(name):
+            return True
+        if name in BUILTIN_NAMES:
+            return True
+        if self.ignore_underscore and name.startswith("_"):
+            return True
+        if self.ignore_private and name.startswith("__"):
+            return True
+        return False
+
     def _check_unused_vars(self, module, duc, result):
-        for scope in _scope_nodes(module):
+        """
+        Emit MEDIUM issues for every definition that has zero users.
+        Covers all scope types including lambdas and comprehensions.
+        """
+        for scope in duc.locals:
             if isinstance(scope, gast.Module):
-                continue
-            scope_locals = duc.locals.get(scope, {})
-            for name, defs in scope_locals.items():
-                if self.ignore_underscore and name.startswith("_"):
+                continue   # module-level unused names are reported differently
+            for name, defn in _iter_scope_defs(duc, scope):
+                if self._should_skip(name):
                     continue
-                if name in BUILTIN_NAMES:
-                    continue
-                for defn in defs:
-                    chain = duc.chains.get(defn)
-                    if chain is None:
-                        continue
-                    if not chain.users():
-                        lineno = getattr(defn.node, "lineno", 0)
-                        result.add_issue(Issue(
-                            kind="unused_var",
-                            name=name,
-                            lineno=lineno,
-                            severity=Issue.SEVERITY_MEDIUM,
-                            message="'{}' defined but never used".format(name),
-                        ))
+                if not defn.users():
+                    lineno = getattr(defn.node, "lineno", 0)
+                    result.add_issue(Issue(
+                        kind="unused_var",
+                        name=name,
+                        lineno=lineno,
+                        severity=Issue.SEVERITY_MEDIUM,
+                        message="'{}' defined but never used".format(name),
+                    ))
 
     def _check_undefined_names(self, module, duc, result):
-        module_locals = set(duc.locals.get(module, {}).keys())
+        """
+        Emit HIGH issues for Name nodes in Load context that have no
+        definition reachable at module scope.
+        """
+        module_names = set()
+        for name, _ in _iter_scope_defs(duc, module):
+            module_names.add(name)
+
         for node in gast.walk(module):
             if not isinstance(node, gast.Name):
                 continue
             if not isinstance(node.ctx, gast.Load):
                 continue
             name = node.id
-            if name in BUILTIN_NAMES or name in module_locals:
+            if name in BUILTIN_NAMES or name in module_names:
                 continue
             result.add_issue(Issue(
                 kind="undefined",
@@ -392,135 +476,37 @@ class CodeAnalyzer:
                 body = node.body
             elif isinstance(node, gast.If):
                 for branch in (node.body, node.orelse):
-                    self._scan_body_for_dead_code(branch, result)
+                    self._scan_for_dead_code(branch, result)
                 continue
             if body:
-                self._scan_body_for_dead_code(body, result)
+                self._scan_for_dead_code(body, result)
 
-    def _scan_body_for_dead_code(self, body, result):
+    def _scan_for_dead_code(self, body, result):
         for i in range(len(body) - 1):
             stmt = body[i]
-            if isinstance(stmt, (gast.Return, gast.Raise, gast.Break, gast.Continue)):
+            if isinstance(stmt, (gast.Return, gast.Raise,
+                                  gast.Break, gast.Continue)):
                 result.add_issue(Issue(
                     kind="dead_code",
                     name="<stmt>",
                     lineno=body[i + 1].lineno,
                     severity=Issue.SEVERITY_HIGH,
-                    message="unreachable statement after {}".format(
-                        type(stmt).__name__.lower()
-                    ),
+                    message="unreachable code after {}".format(
+                        type(stmt).__name__.lower()),
                 ))
-
-    def _check_edge_cases(self, module, duc, result):
-        """
-        Extra checks for constructs that are easy to mishandle:
-        - Lambda with unused parameters
-        - ExceptHandler binding (try/except as e:) that is never used
-        - With-statement target that is never used
-        - Augmented assignment on an undefined name
-        """
-        for node in gast.walk(module):
-
-            # Lambda: check each arg for use
-            if isinstance(node, gast.Lambda):
-                self._check_lambda_args(node, duc, result)
-
-            # try/except ... as <name>: check the binding
-            elif isinstance(node, gast.ExceptHandler):
-                self._check_except_handler(node, duc, result)
-
-            # with ... as <name>: check the target
-            elif isinstance(node, gast.With):
-                self._check_with_targets(node, duc, result)
-
-            # augmented assignment: flag if target looks undefined at module scope
-            elif isinstance(node, gast.AugAssign):
-                self._check_augassign(node, duc, result)
-
-    def _check_lambda_args(self, node, duc, result):
-        scope_locals = duc.locals.get(node, {})
-        for name, defs in scope_locals.items():
-            if self.ignore_underscore and name.startswith("_"):
-                continue
-            for defn in defs:
-                if not isinstance(defn.node, gast.arg):
-                    continue
-                chain = duc.chains.get(defn)
-                if chain is not None and not chain.users():
-                    result.add_issue(Issue(
-                        kind="unused_var",
-                        name=name,
-                        lineno=getattr(defn.node, "lineno", 0),
-                        severity=Issue.SEVERITY_LOW,
-                        message="lambda parameter '{}' is never used".format(name),
-                    ))
-
-    def _check_except_handler(self, node, duc, result):
-        if node.name is None:
-            return
-        name = node.name
-        for scope in _scope_nodes(node):
-            scope_locals = duc.locals.get(scope, {})
-            if name in scope_locals:
-                for defn in scope_locals[name]:
-                    chain = duc.chains.get(defn)
-                    if chain is not None and not chain.users():
-                        lineno = getattr(node, "lineno", 0)
-                        result.add_issue(Issue(
-                            kind="unused_var",
-                            name=name,
-                            lineno=lineno,
-                            severity=Issue.SEVERITY_LOW,
-                            message="exception variable '{}' is bound but never used".format(name),
-                        ))
-                return
-
-    def _check_with_targets(self, node, duc, result):
-        for item in node.items:
-            target = item.optional_vars
-            if target is None:
-                continue
-            names = []
-            if isinstance(target, gast.Name):
-                names.append(target.id)
-            elif isinstance(target, (gast.Tuple, gast.List)):
-                for elt in gast.walk(target):
-                    if isinstance(elt, gast.Name):
-                        names.append(elt.id)
-            for name in names:
-                if self.ignore_underscore and name.startswith("_"):
-                    continue
-                result.add_issue(Issue(
-                    kind="unused_var",
-                    name=name,
-                    lineno=getattr(target, "lineno", 0),
-                    severity=Issue.SEVERITY_LOW,
-                    message="with-statement target '{}' should be verified for use".format(name),
-                ))
-
-    def _check_augassign(self, node, duc, result):
-        if not isinstance(node.target, gast.Name):
-            return
-        name = node.target.id
-        if name in BUILTIN_NAMES:
-            return
 
     def _check_shadowed_names(self, module, duc, result):
-        module_names = set(duc.locals.get(module, {}).keys())
-        for node in gast.walk(module):
-            if not isinstance(node, (gast.FunctionDef, gast.AsyncFunctionDef)):
+        module_names = {name for name, _ in _iter_scope_defs(duc, module)}
+        for scope in duc.locals:
+            if isinstance(scope, gast.Module):
                 continue
-            scope_locals = duc.locals.get(node, {})
-            for name in scope_locals:
+            for name, defn in _iter_scope_defs(duc, scope):
                 if name in module_names and name not in BUILTIN_NAMES:
-                    defs = scope_locals[name]
-                    if not defs:
-                        continue
-                    lineno = getattr(defs[0].node, "lineno", 0)
-                    result.add_issue(Issue(
-                        kind="shadowed",
-                        name=name,
-                        lineno=lineno,
-                        severity=Issue.SEVERITY_LOW,
-                        message="'{}' shadows a module-level name".format(name),
-                    ))
+                    if not _is_synthetic(name):
+                        result.add_issue(Issue(
+                            kind="shadowed",
+                            name=name,
+                            lineno=getattr(defn.node, "lineno", 0),
+                            severity=Issue.SEVERITY_LOW,
+                            message="'{}' shadows a module-level name".format(name),
+                        ))
