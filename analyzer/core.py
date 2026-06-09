@@ -3,23 +3,29 @@ core.py - Static analyzer built on beniget def-use chains.
 
 Compatible with beniget 0.4.x and 0.5.x, Python 3.6+.
 
-beniget 0.5.x API (used throughout):
-  duc.locals[scope]   -> ordered_set of Def objects  (NOT a {name:[Def]} dict)
-  defn.name()         -> str identifier (callable method)
-  defn.users()        -> list[Def] – every node that uses this definition
-  defn.node           -> underlying gast AST node
-
-beniget 0.4.x fallback:
-  duc.locals[scope]   -> dict {name: [Def]}
+Metrics implemented
+-------------------
+Variable Definition Detection  – every name defined anywhere in the file
+Definition-Use Mapping         – each definition -> all its use sites
+Coverage Measurement (DU-Path) – % of (def, use) pairs that have a
+                                  def-clear path; computed as:
+                                    covered = beniget-chained (def,use) pairs
+                                    total   = every (def, use) pair for the
+                                              same variable name
+                                    pct     = covered / total * 100
+Uncovered Definition Detection – definitions with zero users
+Edge Case Handling             – lambdas, comprehensions, classes,
+                                  try/except, with-targets, nested scopes,
+                                  imports, *args/**kwargs
 """
 import gast
 from beniget import DefUseChains
 from collections import defaultdict
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Compatibility helper
+# Compatibility: beniget 0.4.x vs 0.5.x
 # ---------------------------------------------------------------------------
 
 def _iter_scope_defs(duc, scope):
@@ -27,19 +33,20 @@ def _iter_scope_defs(duc, scope):
     """
     Yield (name, Def) for every definition in *scope*.
 
-    Handles both beniget 0.4.x (dict) and 0.5.x (ordered_set).
+    beniget 0.4.x: duc.locals[scope] is {name: [Def]}
+    beniget 0.5.x: duc.locals[scope] is ordered_set of Def  (defn.name() callable)
     """
     scope_data = duc.locals.get(scope)
     if scope_data is None:
         return
 
     if hasattr(scope_data, "items"):
-        # beniget 0.4.x: {name: [Def, ...]}
+        # 0.4.x dict
         for name, defs in scope_data.items():
             for defn in defs:
                 yield name, defn
     else:
-        # beniget 0.5.x: ordered_set of Def objects
+        # 0.5.x ordered_set
         for defn in scope_data:
             raw = defn.name
             name = raw() if callable(raw) else str(raw)
@@ -47,7 +54,104 @@ def _iter_scope_defs(duc, scope):
 
 
 # ---------------------------------------------------------------------------
-# Data containers
+# DU-Pair  (Definition-Use pair)
+# ---------------------------------------------------------------------------
+
+class DUPair:
+    """
+    One (definition, use) pair for a named variable.
+
+    covered = True  ⟺ beniget found a def-clear path from def_lineno to
+                       use_lineno (the variable is not redefined on any path
+                       between the two sites).
+    """
+
+    def __init__(self, name, def_lineno, def_col, use_lineno, use_col, covered):
+        self.name = name
+        self.def_lineno = def_lineno
+        self.def_col = def_col
+        self.use_lineno = use_lineno
+        self.use_col = use_col
+        self.covered = covered
+
+    @property
+    def key(self):
+        return (self.name, self.def_lineno, self.use_lineno)
+
+    def __repr__(self):
+        status = "covered" if self.covered else "uncovered"
+        return "DUPair({!r}: def@{}, use@{}, {})".format(
+            self.name, self.def_lineno, self.use_lineno, status
+        )
+
+
+# ---------------------------------------------------------------------------
+# DU-Path Coverage
+# ---------------------------------------------------------------------------
+
+class DUPathCoverage:
+    """
+    DU-path coverage for one source file.
+
+    Algorithm
+    ---------
+    For each variable name *x*:
+      D = all definition sites of *x*
+      U = all use sites of *x*  (Name nodes in Load context)
+
+      total_pairs  = { (d, u) | d ∈ D, u ∈ U }   — Cartesian product
+      covered_pairs = those pairs where beniget chains d → u
+                      (guarantees a def-clear path exists in the CFG)
+
+    coverage_pct = |covered_pairs| / |total_pairs| * 100
+    """
+
+    def __init__(self):
+        self.du_pairs = []       # type: List[DUPair]
+
+    def add(self, pair):
+        # type: (DUPair) -> None
+        self.du_pairs.append(pair)
+
+    @property
+    def total(self):
+        return len(self.du_pairs)
+
+    @property
+    def covered(self):
+        return sum(1 for p in self.du_pairs if p.covered)
+
+    @property
+    def uncovered(self):
+        return sum(1 for p in self.du_pairs if not p.covered)
+
+    @property
+    def covered_pairs(self):
+        return [p for p in self.du_pairs if p.covered]
+
+    @property
+    def uncovered_pairs(self):
+        return [p for p in self.du_pairs if not p.covered]
+
+    @property
+    def coverage_pct(self):
+        # type: () -> float
+        if self.total == 0:
+            return 100.0
+        return round(self.covered / self.total * 100.0, 2)
+
+    def by_variable(self, name):
+        # type: (str) -> List[DUPair]
+        return [p for p in self.du_pairs if p.name == name]
+
+    def __repr__(self):
+        return "DUPathCoverage(total={}, covered={}, pct={:.1f}%)".format(
+            self.total, self.covered, self.coverage_pct
+        )
+
+
+# ---------------------------------------------------------------------------
+# DefUseEntry  (single definition + its use locations)
 # ---------------------------------------------------------------------------
 
 class DefUseEntry:
@@ -80,8 +184,16 @@ class DefUseEntry:
         )
 
 
+# ---------------------------------------------------------------------------
+# CoverageMetrics  (definition-level coverage – "which defs have any use")
+# ---------------------------------------------------------------------------
+
 class CoverageMetrics:
-    """Coverage summary: how many definitions are actually used."""
+    """
+    Definition-level coverage: how many definitions have ≥1 user.
+
+    Note: for DU-path coverage (pair-level granularity) see DUPathCoverage.
+    """
 
     def __init__(self):
         self.total_defs = 0
@@ -112,6 +224,10 @@ class CoverageMetrics:
         )
 
 
+# ---------------------------------------------------------------------------
+# Issue
+# ---------------------------------------------------------------------------
+
 class Issue:
     """A single analysis finding."""
 
@@ -132,28 +248,41 @@ class Issue:
         )
 
 
+# ---------------------------------------------------------------------------
+# AnalysisResult
+# ---------------------------------------------------------------------------
+
 class AnalysisResult:
     """All findings for a single source file."""
 
     def __init__(self, filepath):
         self.filepath = filepath
-        self.issues = []                    # type: List[Issue]
-        self.errors = []                    # type: List[str]
+        self.issues = []                     # type: List[Issue]
+        self.errors = []                     # type: List[str]
         self.loc = 0
-        self.def_use_map = {}               # type: Dict[Tuple, DefUseEntry]
-        self.coverage = CoverageMetrics()
+        self.def_use_map = {}                # type: Dict[Tuple, DefUseEntry]
+        self.coverage = CoverageMetrics()    # definition-level coverage
+        self.du_path_coverage = DUPathCoverage()  # DU-pair coverage
 
-    # convenience alias so callers can use result.coverage_pct directly
+    # ── convenience aliases ────────────────────────────────────────────────
     @property
     def coverage_pct(self):
+        """Definition-level coverage %."""
         return self.coverage.coverage_pct
 
+    @property
+    def du_coverage_pct(self):
+        """DU-path coverage %."""
+        return self.du_path_coverage.coverage_pct
+
+    # ── mutation helpers ───────────────────────────────────────────────────
     def add_issue(self, issue):
         self.issues.append(issue)
 
     def add_error(self, msg):
         self.errors.append(msg)
 
+    # ── queries ────────────────────────────────────────────────────────────
     @property
     def total_issues(self):
         return len(self.issues)
@@ -167,8 +296,7 @@ class AnalysisResult:
 
     def get_def_at(self, lineno, name=None):
         # type: (int, Optional[str]) -> Optional[DefUseEntry]
-        """Return the DefUseEntry defined on *lineno* (optionally matching *name*)."""
-        for key, entry in self.def_use_map.items():
+        for entry in self.def_use_map.values():
             if entry.lineno == lineno:
                 if name is None or entry.name == name:
                     return entry
@@ -176,27 +304,35 @@ class AnalysisResult:
 
     def get_uses_for(self, lineno, name=None):
         # type: (int, Optional[str]) -> List[Tuple[int, int]]
-        """Return all use-sites for the definition on *lineno*."""
         entry = self.get_def_at(lineno, name)
         return entry.uses if entry else []
+
+    def get_du_pairs_for(self, name):
+        # type: (str) -> List[DUPair]
+        """Return all DU-pairs for variable *name*."""
+        return self.du_path_coverage.by_variable(name)
 
     def summary(self):
         kinds = defaultdict(int)
         for issue in self.issues:
             kinds[issue.kind] += 1
         parts = ["{}: {}".format(k, v) for k, v in sorted(kinds.items())]
-        return "{} | {}".format(self.filepath, ", ".join(parts))
+        return "{} | du_cov={:.1f}% | {}".format(
+            self.filepath, self.du_coverage_pct, ", ".join(parts)
+        )
 
     def __repr__(self):
         return (
-            "AnalysisResult(filepath={!r}, issues={}, coverage={:.1f}%)".format(
-                self.filepath, self.total_issues, self.coverage_pct
+            "AnalysisResult(filepath={!r}, issues={}, "
+            "def_cov={:.1f}%, du_cov={:.1f}%)".format(
+                self.filepath, self.total_issues,
+                self.coverage_pct, self.du_coverage_pct,
             )
         )
 
 
 # ---------------------------------------------------------------------------
-# Built-in names (never flagged as undefined / unused)
+# Built-in names
 # ---------------------------------------------------------------------------
 
 BUILTIN_NAMES = {
@@ -222,7 +358,7 @@ BUILTIN_NAMES = {
     "SystemError", "SystemExit", "TimeoutError", "UnicodeDecodeError",
     "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError",
     "UserWarning", "Warning", "ZeroDivisionError",
-    "BaseException", "BaseExceptionGroup", "ExceptionGroup",
+    "BaseException", "ExceptionGroup",
 }
 
 
@@ -238,7 +374,6 @@ def _node_kind(node, scope=None):
         return "lambda"
     if isinstance(node, (gast.ListComp, gast.SetComp, gast.DictComp, gast.GeneratorExp)):
         return "comprehension"
-    # Detect function parameters: Name nodes inside function arg lists
     if isinstance(node, gast.Name) and scope is not None:
         if isinstance(scope, (gast.FunctionDef, gast.AsyncFunctionDef, gast.Lambda)):
             args = scope.args
@@ -257,7 +392,6 @@ def _node_kind(node, scope=None):
 
 def _is_synthetic(name):
     # type: (str) -> bool
-    """Return True for beniget-internal synthetic names like '<ListComp>'."""
     return name.startswith("<") and name.endswith(">")
 
 
@@ -269,21 +403,18 @@ class CodeAnalyzer:
     """
     Analyses Python source using beniget def-use chains.
 
-    Covers:
-      Variable Definition Detection  – every name defined anywhere in the file
-      Definition-Use Mapping         – each definition -> list of use sites
-      Coverage Measurement           – % of definitions with ≥1 use
-      Uncovered Definition Detection – definitions with zero uses
-      Edge Case Handling             – lambdas, comprehensions, classes,
-                                       try/except bindings, with-targets,
-                                       augmented assignments, nested scopes,
-                                       imports, *args/**kwargs, decorators
+    Key outputs in AnalysisResult
+    ------------------------------
+    def_use_map       : {(lineno,col,name) -> DefUseEntry}
+    coverage          : CoverageMetrics  – definition-level
+    du_path_coverage  : DUPathCoverage   – pair-level (DU-path validation)
+    issues            : List[Issue]
     """
 
     def __init__(self, ignore_private=False, ignore_underscore=True):
         self.ignore_private = ignore_private
         self.ignore_underscore = ignore_underscore
-        self._results = {}   # type: Dict[str, AnalysisResult]
+        self._results = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -291,7 +422,6 @@ class CodeAnalyzer:
 
     def analyze_source(self, source, filepath="<string>"):
         # type: (str, str) -> AnalysisResult
-        """Parse *source* and return a fully populated :class:`AnalysisResult`."""
         result = AnalysisResult(filepath)
         result.loc = source.count("\n") + 1
 
@@ -309,9 +439,9 @@ class CodeAnalyzer:
             result.add_error("beniget error: {}".format(exc))
             return result
 
-        # Core passes ─ order matters
         self._build_def_use_map(module, duc, result)
-        self._compute_coverage(result)
+        self._compute_def_coverage(result)
+        self._compute_du_path_coverage(module, duc, result)
         self._check_unused_vars(module, duc, result)
         self._check_undefined_names(module, duc, result)
         self._check_dead_code(module, result)
@@ -341,32 +471,19 @@ class CodeAnalyzer:
     def _build_def_use_map(self, module, duc, result):
         """
         Populate result.def_use_map: (lineno, col, name) -> DefUseEntry.
-
-        Iterates EVERY scope beniget knows about, which automatically covers:
-        - Module level
-        - Functions and async functions
-        - Classes and their methods
-        - Lambda expressions
-        - List / set / dict comprehensions and generator expressions
-        - Nested / inner functions
-        - Exception-handler bindings  (appear in enclosing scope)
-        - with-statement targets       (appear in enclosing scope)
+        Covers all scope types beniget knows about.
         """
         seen = set()
-
         for scope in duc.locals:
             for name, defn in _iter_scope_defs(duc, scope):
                 if _is_synthetic(name):
                     continue
-
                 node = defn.node
                 if not hasattr(node, "lineno"):
                     continue
-
                 lineno = node.lineno
                 col = getattr(node, "col_offset", 0)
                 key = (lineno, col, name)
-
                 if key in seen:
                     continue
                 seen.add(key)
@@ -377,8 +494,6 @@ class CodeAnalyzer:
                     lineno=lineno,
                     col_offset=col,
                 )
-
-                # defn.users() is beniget's direct API – works in both 0.4.x and 0.5.x
                 for user in defn.users():
                     u = user.node
                     if hasattr(u, "lineno"):
@@ -387,34 +502,102 @@ class CodeAnalyzer:
                 result.def_use_map[key] = entry
 
     # ------------------------------------------------------------------
-    # Coverage Measurement
+    # Definition-level coverage
     # ------------------------------------------------------------------
 
-    def _compute_coverage(self, result):
+    def _compute_def_coverage(self, result):
         """
-        Populate result.coverage from result.def_use_map.
-
-        Every non-synthetic, non-builtin definition counts toward
-        total_defs; those with ≥1 use count toward covered_defs.
+        Populate result.coverage: count of defs with ≥1 user vs total defs.
         """
         for entry in result.def_use_map.values():
-            if entry.name in BUILTIN_NAMES:
-                continue
-            if _is_synthetic(entry.name):
+            if entry.name in BUILTIN_NAMES or _is_synthetic(entry.name):
                 continue
             if self.ignore_underscore and entry.name.startswith("_"):
                 continue
             result.coverage.add_entry(entry)
 
     # ------------------------------------------------------------------
+    # DU-Path Coverage  ← the Coverage Measurement metric
+    # ------------------------------------------------------------------
+
+    def _compute_du_path_coverage(self, module, duc, result):
+        """
+        Compute DU-path coverage (pair-level).
+
+        Algorithm:
+          For each variable name x (non-builtin, non-synthetic):
+            D  = all definition nodes of x (across all scopes)
+            U  = all Load-context Name nodes for x in the module
+            covered_set = { (d.lineno, u.lineno) |
+                            u ∈ d.users() }  ← beniget def-clear chains
+
+          For every (d, u) ∈ D × U:
+            pair.covered = (d.lineno, u.lineno) ∈ covered_set
+
+          DU-path coverage = |covered| / |D × U| * 100
+        """
+        # Collect all definitions by variable name
+        defs_by_name = defaultdict(list)   # name -> [(lineno, col, Def)]
+        for scope in duc.locals:
+            for name, defn in _iter_scope_defs(duc, scope):
+                if _is_synthetic(name) or name in BUILTIN_NAMES:
+                    continue
+                if self.ignore_underscore and name.startswith("_"):
+                    continue
+                node = defn.node
+                if not hasattr(node, "lineno"):
+                    continue
+                defs_by_name[name].append(
+                    (node.lineno, getattr(node, "col_offset", 0), defn)
+                )
+
+        # Collect all use sites by variable name
+        uses_by_name = defaultdict(list)   # name -> [(lineno, col)]
+        for node in gast.walk(module):
+            if isinstance(node, gast.Name) and isinstance(node.ctx, gast.Load):
+                name = node.id
+                if _is_synthetic(name) or name in BUILTIN_NAMES:
+                    continue
+                if self.ignore_underscore and name.startswith("_"):
+                    continue
+                uses_by_name[name].append(
+                    (node.lineno, getattr(node, "col_offset", 0))
+                )
+
+        # Build covered set from beniget chains
+        covered_keys = set()   # (name, def_lineno, use_lineno)
+        for name, def_list in defs_by_name.items():
+            for def_lineno, _, defn in def_list:
+                for user in defn.users():
+                    u_node = user.node
+                    if hasattr(u_node, "lineno"):
+                        covered_keys.add((name, def_lineno, u_node.lineno))
+
+        # Build full DU-pair set: D × U for each name
+        seen_pairs = set()
+        for name in set(list(defs_by_name.keys()) + list(uses_by_name.keys())):
+            for def_lineno, def_col, _ in defs_by_name.get(name, []):
+                for use_lineno, use_col in uses_by_name.get(name, []):
+                    pair_key = (name, def_lineno, use_lineno)
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    covered = pair_key in covered_keys
+                    result.du_path_coverage.add(DUPair(
+                        name=name,
+                        def_lineno=def_lineno,
+                        def_col=def_col,
+                        use_lineno=use_lineno,
+                        use_col=use_col,
+                        covered=covered,
+                    ))
+
+    # ------------------------------------------------------------------
     # Issue detection
     # ------------------------------------------------------------------
 
     def _should_skip(self, name):
-        # type: (str) -> bool
-        if _is_synthetic(name):
-            return True
-        if name in BUILTIN_NAMES:
+        if _is_synthetic(name) or name in BUILTIN_NAMES:
             return True
         if self.ignore_underscore and name.startswith("_"):
             return True
@@ -423,13 +606,9 @@ class CodeAnalyzer:
         return False
 
     def _check_unused_vars(self, module, duc, result):
-        """
-        Emit MEDIUM issues for every definition that has zero users.
-        Covers all scope types including lambdas and comprehensions.
-        """
         for scope in duc.locals:
             if isinstance(scope, gast.Module):
-                continue   # module-level unused names are reported differently
+                continue
             for name, defn in _iter_scope_defs(duc, scope):
                 if self._should_skip(name):
                     continue
@@ -444,14 +623,7 @@ class CodeAnalyzer:
                     ))
 
     def _check_undefined_names(self, module, duc, result):
-        """
-        Emit HIGH issues for Name nodes in Load context that have no
-        definition reachable at module scope.
-        """
-        module_names = set()
-        for name, _ in _iter_scope_defs(duc, module):
-            module_names.add(name)
-
+        module_names = {name for name, _ in _iter_scope_defs(duc, module)}
         for node in gast.walk(module):
             if not isinstance(node, gast.Name):
                 continue
@@ -501,12 +673,11 @@ class CodeAnalyzer:
             if isinstance(scope, gast.Module):
                 continue
             for name, defn in _iter_scope_defs(duc, scope):
-                if name in module_names and name not in BUILTIN_NAMES:
-                    if not _is_synthetic(name):
-                        result.add_issue(Issue(
-                            kind="shadowed",
-                            name=name,
-                            lineno=getattr(defn.node, "lineno", 0),
-                            severity=Issue.SEVERITY_LOW,
-                            message="'{}' shadows a module-level name".format(name),
-                        ))
+                if name in module_names and not self._should_skip(name):
+                    result.add_issue(Issue(
+                        kind="shadowed",
+                        name=name,
+                        lineno=getattr(defn.node, "lineno", 0),
+                        severity=Issue.SEVERITY_LOW,
+                        message="'{}' shadows a module-level name".format(name),
+                    ))

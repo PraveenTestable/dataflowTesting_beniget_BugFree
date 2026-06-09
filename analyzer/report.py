@@ -30,18 +30,28 @@ def format_issue(issue, show_severity=True):
 
 def format_coverage(result):
     # type: (AnalysisResult) -> str
-    """Render the coverage section of the report."""
+    """Render both definition-level and DU-path coverage."""
     cov = result.coverage
+    du = result.du_path_coverage
     lines = [
-        "Coverage : {:.1f}%  ({}/{} definitions used)".format(
+        "Def Coverage    : {:.1f}%  ({}/{} definitions used)".format(
             cov.coverage_pct, cov.covered_defs, cov.total_defs
-        )
+        ),
+        "DU-Path Coverage: {:.1f}%  ({}/{} DU-pairs covered)".format(
+            du.coverage_pct, du.covered, du.total
+        ),
     ]
     if cov.uncovered:
         lines.append("  Uncovered definitions:")
         for entry in sorted(cov.uncovered, key=lambda e: e.lineno):
             lines.append("    line {:4d}  [{}] {}".format(
                 entry.lineno, entry.kind, entry.name
+            ))
+    if du.uncovered_pairs:
+        lines.append("  Uncovered DU-pairs:")
+        for pair in sorted(du.uncovered_pairs, key=lambda p: (p.name, p.def_lineno)):
+            lines.append("    {!r}: def@{} -> use@{}".format(
+                pair.name, pair.def_lineno, pair.use_lineno
             ))
     return "\n".join(lines)
 

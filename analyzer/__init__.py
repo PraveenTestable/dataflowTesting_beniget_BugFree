@@ -1,7 +1,7 @@
 """beniget-based static analyzer for Python 3.6+ code."""
 from .core import (
     CodeAnalyzer, AnalysisResult, Issue,
-    DefUseEntry, CoverageMetrics,
+    DefUseEntry, CoverageMetrics, DUPair, DUPathCoverage,
 )
 from .report import (
     format_result, format_summary_table, format_coverage,
@@ -9,10 +9,10 @@ from .report import (
 )
 from .utils import collect_python_files, count_lines, deduplicate_issues
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "CodeAnalyzer", "AnalysisResult", "Issue",
-    "DefUseEntry", "CoverageMetrics",
+    "DefUseEntry", "CoverageMetrics", "DUPair", "DUPathCoverage",
     "format_result", "format_summary_table", "format_coverage",
     "format_def_use_map", "write_report",
     "collect_python_files", "count_lines", "deduplicate_issues",
